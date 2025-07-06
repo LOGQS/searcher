@@ -241,8 +241,8 @@ class RateLimitConfig:
     
 # Model-specific rate limits
 RATE_LIMITS = {
-    "gemini-2.5-pro": RateLimitConfig(rpm=5, tpm=250000, rpd=100),
-    "gemini-2.5-flash": RateLimitConfig(rpm=10, tpm=250000, rpd=250),
+    "gemini-2.5-pro": RateLimitConfig(rpm=4, tpm=200000, rpd=80),  # More conservative limits
+    "gemini-2.5-flash": RateLimitConfig(rpm=8, tpm=200000, rpd=200),  # More conservative limits
 }
 
 class RateLimiter:
@@ -367,6 +367,56 @@ rate_limiters = {
 
 # Global rate limiting lock to prevent parallel API calls
 _global_api_lock = asyncio.Lock()
+
+# Circuit breaker to prevent rapid retries when API is consistently failing
+class CircuitBreaker:
+    """Circuit breaker to prevent rapid retries when API is consistently failing."""
+    
+    def __init__(self, model: str, failure_threshold: int = 5, timeout: int = 60):
+        self.model = model
+        self.failure_threshold = failure_threshold
+        self.timeout = timeout
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.state = "closed"  # closed, open, half-open
+        
+    def record_success(self):
+        """Record a successful API call."""
+        self.failure_count = 0
+        self.state = "closed"
+        
+    def record_failure(self):
+        """Record a failed API call."""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.failure_count >= self.failure_threshold:
+            self.state = "open"
+            coordinated_console.print(f"[bold yellow]⚠️ Circuit breaker opened for {self.model} after {self.failure_count} failures[/bold yellow]")
+        
+    def can_proceed(self) -> bool:
+        """Check if we can proceed with API call."""
+        if self.state == "closed":
+            return True
+        elif self.state == "open":
+            if time.time() - self.last_failure_time > self.timeout:
+                self.state = "half-open"
+                coordinated_console.print(f"[dim yellow]Circuit breaker for {self.model} moving to half-open[/dim yellow]")
+                return True
+            return False
+        elif self.state == "half-open":
+            return True
+        return False
+    
+    def should_wait(self) -> int:
+        """Return seconds to wait before next attempt."""
+        if self.state == "open":
+            return max(0, self.timeout - int(time.time() - self.last_failure_time))
+        return 0
+
+# Global circuit breakers for each model
+circuit_breakers = {
+    model: CircuitBreaker(model) for model in RATE_LIMITS.keys()
+}
 
 @dataclass 
 class AgentState:
@@ -1434,6 +1484,14 @@ class GeminiAgent:
         """Gemini API call with retry on quota/overload errors and proactive rate limiting."""
         import re, time as _time
         
+        # Check circuit breaker first
+        breaker = circuit_breakers.get(model)
+        if breaker and not breaker.can_proceed():
+            wait_time = breaker.should_wait()
+            if wait_time > 0:
+                coordinated_console.print(f"[bold red]🚫 Circuit breaker is open for {model}. Please wait {wait_time} seconds before retrying.[/bold red]")
+                raise Exception(f"Circuit breaker is open for {model}. Wait {wait_time} seconds before retrying.")
+        
         # PROACTIVE RATE LIMITING before API call
         content_size = sum(len(str(content)) for content in contents)
         estimated_tokens = content_size // 4 + 1000  # Basic estimation with buffer
@@ -1451,10 +1509,20 @@ class GeminiAgent:
                 response = self.client.models.generate_content(model=model, contents=contents, config=config)
                 # Log response to interactions.log
                 gemini_response_logger.log_response(response, f"_call_gemini_api({model})")
+                
+                # Record success with circuit breaker
+                if breaker:
+                    breaker.record_success()
+                    
                 return response
             except Exception as err:
                 err_str = str(err)
                 transient = any(tok in err_str for tok in ["RESOURCE_EXHAUSTED", "UNAVAILABLE", "rate limit", "quota"])
+                
+                # Record failure with circuit breaker
+                if breaker and transient:
+                    breaker.record_failure()
+                
                 if attempt >= max_retries or not transient:
                     # Persist the prompt for post-mortem analysis
                     try:
@@ -1490,6 +1558,87 @@ class GeminiAgent:
                 else:
                     coordinated_console.print(f"[yellow]⏳ Gemini API quota hit. Retrying in {retry_sec}s (attempt {attempt+1}/{max_retries})…[/yellow]")
                 _time.sleep(retry_sec)
+                attempt += 1
+                # After sleep, clear status
+                status_tracker.api_status = ""
+                continue
+
+    async def _call_gemini_api_stream(self, *, model: str, contents, config):
+        """Gemini API streaming call with retry on quota/overload errors and proactive rate limiting."""
+        import re, time as _time
+        
+        # Check circuit breaker first
+        breaker = circuit_breakers.get(model)
+        if breaker and not breaker.can_proceed():
+            wait_time = breaker.should_wait()
+            if wait_time > 0:
+                coordinated_console.print(f"[bold red]🚫 Circuit breaker is open for {model}. Please wait {wait_time} seconds before retrying.[/bold red]")
+                raise Exception(f"Circuit breaker is open for {model}. Wait {wait_time} seconds before retrying.")
+        
+        # PROACTIVE RATE LIMITING before API call
+        content_size = sum(len(str(content)) for content in contents)
+        estimated_tokens = content_size // 4 + 1000  # Basic estimation with buffer
+        limiter = rate_limiters.get(model)
+        if limiter:
+            await limiter.wait_if_needed(estimated_tokens)
+        
+        max_retries = 3
+        attempt = 0
+        while True:
+            try:
+                # Log prompt and history before API call
+                prompt_history_logger.log_api_call(contents, f"_call_gemini_api_stream({model})", config, model)
+                
+                response_stream = self.client.models.generate_content_stream(model=model, contents=contents, config=config)
+                
+                # Record success with circuit breaker
+                if breaker:
+                    breaker.record_success()
+                    
+                return response_stream
+            except Exception as err:
+                err_str = str(err)
+                transient = any(tok in err_str for tok in ["RESOURCE_EXHAUSTED", "UNAVAILABLE", "rate limit", "quota"])
+                
+                # Record failure with circuit breaker
+                if breaker and transient:
+                    breaker.record_failure()
+                
+                if attempt >= max_retries or not transient:
+                    # Persist the prompt for post-mortem analysis
+                    try:
+                        debug_dir = Path("research_results") / "debug_prompts"
+                        debug_dir.mkdir(parents=True, exist_ok=True)
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        dump_path = debug_dir / f"prompt_dump_stream_{ts}.txt"
+                        with open(dump_path, "w", encoding="utf-8") as f:
+                            plain_contents = "\n".join(str(c) for c in contents)
+                            f.write(plain_contents)
+                            f.write(f"\n\n---\nCharacter length: {len(plain_contents)}\nWord count: {len(plain_contents.split())}\n")
+                        coordinated_console.print(f"[red]❌ API streaming failure. Prompt saved to {dump_path}[/red]")
+                    except Exception:
+                        pass
+                    raise
+
+                retry_sec = 5 * (attempt + 1)
+                match = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+)s", err_str)
+                if match:
+                    try:
+                        retry_sec = int(match.group(1))
+                    except ValueError:
+                        pass
+
+                # Update global API status for live dashboard
+                status_tracker.api_status = f"Streaming rate-limit: retry in {retry_sec}s (try {attempt+1}/{max_retries})"
+                if coordinated_console.live_console is not None:
+                    coordinated_console.live_console.update(
+                        Group(
+                            status_tracker.create_status_table()
+                        )
+                    )
+                else:
+                    coordinated_console.print(f"[yellow]⏳ Gemini API streaming quota hit. Retrying in {retry_sec}s (attempt {attempt+1}/{max_retries})…[/yellow]")
+                await asyncio.sleep(retry_sec)
                 attempt += 1
                 # After sleep, clear status
                 status_tracker.api_status = ""
@@ -1974,10 +2123,8 @@ You now have updated research materials. Is the information sufficient to answer
             if limiter:
                 await limiter.wait_if_needed(estimated_tokens)
             
-            # Log streaming API call
-            prompt_history_logger.log_api_call(context, f"generate_content_stream({self.config.model})", self.generation_config, self.config.model)
-            
-            response_stream = self.client.models.generate_content_stream(
+            # Use robust streaming wrapper with automatic retry
+            response_stream = await self._call_gemini_api_stream(
                 model=self.config.model,
                 contents=context,
                 config=self.generation_config
@@ -2193,7 +2340,14 @@ You now have updated research materials. Is the information sufficient to answer
             # Log streaming error for main agent
             if self.config.model == "gemini-2.5-pro" and main_agent_logger:
                 main_agent_logger.log_error(f"Error during streaming: {e}")
-            coordinated_console.print(f"\n[bold red]❌ Error during streaming: {str(e)}[/bold red]")
+            
+            err_str = str(e)
+            # Check if this is a rate limit error that should be retried
+            if any(tok in err_str for tok in ["RESOURCE_EXHAUSTED", "UNAVAILABLE", "rate limit", "quota"]):
+                coordinated_console.print(f"\n[bold red]❌ API quota/rate limit error during streaming: {str(e)}[/bold red]")
+                coordinated_console.print(f"[dim red]The system has already attempted retries. Please wait before sending another request.[/dim red]")
+            else:
+                coordinated_console.print(f"\n[bold red]❌ Error during streaming: {str(e)}[/bold red]")
 
     async def _stream_response_with_function_handling(self, context):
         """Helper method to handle streaming with recursive function call support."""
@@ -2239,10 +2393,8 @@ You now have updated research materials. Is the information sufficient to answer
             if limiter:
                 await limiter.wait_if_needed(estimated_tokens)
             
-            # Log followup streaming API call
-            prompt_history_logger.log_api_call(context, f"followup_generate_content_stream({self.config.model})", self.generation_config, self.config.model)
-            
-            response_stream = self.client.models.generate_content_stream(
+            # Use robust streaming wrapper with automatic retry for follow-up calls
+            response_stream = await self._call_gemini_api_stream(
                 model=self.config.model,
                 contents=context,
                 config=self.generation_config
@@ -2391,7 +2543,13 @@ You now have updated research materials. Is the information sufficient to answer
                 console.print(f"\n[dim green]✅ Response completed[/dim green]")
                 
         except Exception as e:
-            coordinated_console.print(f"\n[bold red]❌ Error during follow-up streaming: {str(e)}[/bold red]")
+            err_str = str(e)
+            # Check if this is a rate limit error that should be retried
+            if any(tok in err_str for tok in ["RESOURCE_EXHAUSTED", "UNAVAILABLE", "rate limit", "quota"]):
+                coordinated_console.print(f"\n[bold red]❌ API quota/rate limit error during follow-up streaming: {str(e)}[/bold red]")
+                coordinated_console.print(f"[dim red]The system has already attempted retries. Please wait before sending another request.[/dim red]")
+            else:
+                coordinated_console.print(f"\n[bold red]❌ Error during follow-up streaming: {str(e)}[/bold red]")
 
     def _build_context(self) -> List[types.Content]:
         """Build conversation context from history."""
