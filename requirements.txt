@@ -1,0 +1,15 @@
+crawl4ai # pip install -U crawl4ai & crawl4ai-setup
+google-genai
+psutil
+aiofiles
+duckduckgo-search
+googlesearch-python
+requests
+bs4
+urllib3
+prompt_toolkit
+rich
+pathlib
+dotenv
+datetime
+scrapingant-client
